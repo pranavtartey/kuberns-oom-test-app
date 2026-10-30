@@ -17,6 +17,9 @@ PORT = int(os.environ.get("PORT", "8000"))
 # Keeps every allocated block referenced so Python never frees it.
 _hog = []
 
+# While the clock is before this, /health answers 500 and the container's HEALTHCHECK fails.
+_sick_until = 0.0
+
 
 def memory_mb():
     """Container memory in MB from the cgroup (v2, then v1); -1 if unreadable."""
@@ -72,11 +75,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):
+        global _sick_until
         url = urlparse(self.path)
         query = parse_qs(url.query)
 
-        if url.path in ("/", "/health"):
+        if url.path == "/health" and time.time() < _sick_until:
+            self._reply(500, {"status": "sick", "seconds_left": int(_sick_until - time.time())})
+        elif url.path in ("/", "/health"):
             self._reply(200, {"status": "ok", "memory_mb": memory_mb(), "hog_blocks": len(_hog)})
+        elif url.path == "/sick":
+            seconds = int(query.get("seconds", ["180"])[0])
+            _sick_until = time.time() + seconds
+            self._reply(202, {"status": "health check will fail", "seconds": seconds})
         elif url.path == "/oom":
             step_mb = int(query.get("mb", ["25"])[0])
             delay = float(query.get("delay", ["0.1"])[0])
