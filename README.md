@@ -13,6 +13,10 @@ Stdlib Python, listens on `0.0.0.0:8000` (the port Kuberns publishes for Python 
 | `/crash` | Stack trace pointing at `price_of_first_item`, exit 1 | `exit_recovered` (Docker restarts it at once) |
 | `/exit?code=3` | Exit with the given code | `exit_recovered`, or `exit_nonzero` if it stays down |
 | `/sick?seconds=180` | `/health` answers 500 for that long while the app keeps running | `unhealthy` |
+| `/mem?percent=90` | Grows to that share of the container's memory limit and holds there (97 for critical, never above 98) | `memory_pressure` from 85%, `memory_critical` from 95% |
+| `/cpu?seconds=480` | One busy process per CPU for that long, so the container uses the whole host | `cpu_throttled` |
+| `/disk?percent=92` | Writes `/tmp/disk-fill` until the root filesystem is that full (never above 97) | `disk_pressure` from 90%, `disk_full` from 95% |
+| `/release` | Frees the memory `/mem` and `/oom` hold and deletes the disk file | none |
 | `/`, `/health` | OK plus current container memory | none |
 
 Env var `CRASH_ON_START=1` crashes the app on boot, which gives a restart loop.
@@ -37,5 +41,34 @@ Env var `CRASH_ON_START=1` crashes the app on boot, which gives a restart loop.
   agent treats a die that follows a signal as deliberate.
 - Kuberns detects the start command with an LLM. If it picks the wrong one, set it to
   `python app.py` by hand.
+
+## Events the app cannot cause
+
+`send-event.sh` sends a fake agent event to the backend from the EC2 instance, through the agent
+container, so its secret is used on the box and never printed:
+
+```
+./send-event.sh ssl_expiring
+./send-event.sh disk_pressure "Disk usage at 93% (threshold: 90%)"
+```
+
+Statuses: `ssl_expiring`, `ssl_expired`, `disk_pressure`, `disk_full`, `cpu_throttled`,
+`memory_pressure`, `memory_critical`, `memory_thrash`, `host_memory_restart`, `recurring_selfheal`.
+It prints the backend's reply; `skipped_duplicate` means the same kind of event was already
+recorded inside its window.
+
+## Notes for the disk, memory and CPU triggers
+
+- The agent samples memory and CPU every 120s and needs 3 breaches in a row, so keep the load for
+  at least 6 minutes (`/cpu` defaults to 8). Disk is checked once an hour, so `/disk` can take up to
+  an hour to show; use `send-event.sh` when you do not want to wait. Call `/release` afterwards:
+  the file is on the host's disk.
+- `/mem` needs the container to have a memory limit; without one it answers 400.
+- The backend keeps one incident per kind per window: SSL 24h, disk 6h, CPU and memory 30 minutes,
+  crash digest 6h. A repeat inside the window is dropped. Disk and host-memory incidents are
+  recorded against the server, not the app container.
+- The host-memory guard (`host_memory_restart`) and memory thrash only fire when the host itself is
+  nearly out of RAM; use `send-event.sh` for them rather than starving the box.
+
 # kuberns-oom-test-app
 # kuberns-oom-test-app

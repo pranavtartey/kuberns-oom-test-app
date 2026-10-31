@@ -5,6 +5,7 @@ except CRASH_ON_START=1, which makes the app crash on boot to produce a restart 
 """
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -20,6 +21,13 @@ _hog = []
 # While the clock is before this, /health answers 500 and the container's HEALTHCHECK fails.
 _sick_until = 0.0
 
+DISK_FILL_PATH = "/tmp/disk-fill"
+DISK_FILL_CHUNK_MB = 64
+# Past this the host can stop answering SSH, so /disk never goes further.
+DISK_FILL_MAX_PERCENT = 97
+MEMORY_HOLD_MAX_PERCENT = 98
+_stop_fill = threading.Event()
+
 
 def memory_mb():
     """Container memory in MB from the cgroup (v2, then v1); -1 if unreadable."""
@@ -33,6 +41,72 @@ def memory_mb():
         except OSError:
             continue
     return -1
+
+
+def memory_limit_mb():
+    """Container memory limit in MB from the cgroup (v2, then v1); -1 when there is none."""
+    for path in (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ):
+        try:
+            with open(path) as f:
+                raw = f.read().strip()
+        except OSError:
+            continue
+        if raw == "max":
+            return -1
+        limit = int(raw) // (1024 * 1024)
+        # cgroup v1 reports an absurdly large number for "no limit".
+        return limit if limit < 1024 * 1024 else -1
+    return -1
+
+
+def hold_memory(percent, step_mb=5):
+    """Grows to `percent` of the container's memory limit and stays there."""
+    limit = memory_limit_mb()
+    target = limit * percent // 100
+    while memory_mb() < target and len(_hog) * step_mb < limit:
+        _hog.append(b"x" * (step_mb * 1024 * 1024))
+        time.sleep(0.05)
+    print(f"holding {memory_mb()} MB of a {limit} MB limit", flush=True)
+
+
+def burn_cpu(seconds):
+    """One busy process per CPU, so the container uses the whole host rather than one core."""
+    deadline = time.time() + seconds
+    code = "import sys, time\nend = float(sys.argv[1])\nwhile time.time() < end:\n    pass"
+    for _ in range(os.cpu_count() or 1):
+        subprocess.Popen([sys.executable, "-c", code, str(deadline)])
+
+
+def disk_percent():
+    """Used share of the root filesystem the way `df /` reports it."""
+    stats = os.statvfs("/")
+    used = (stats.f_blocks - stats.f_bfree) * stats.f_frsize
+    available = stats.f_bavail * stats.f_frsize
+    return 100 * used / (used + available)
+
+
+def fill_disk(percent):
+    chunk = b"\0" * (DISK_FILL_CHUNK_MB * 1024 * 1024)
+    _stop_fill.clear()
+    with open(DISK_FILL_PATH, "ab") as f:
+        while disk_percent() < percent and not _stop_fill.is_set():
+            f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+    print(f"disk is {disk_percent():.1f}% full", flush=True)
+
+
+def release():
+    """Gives back the memory and disk the triggers above are holding."""
+    _stop_fill.set()
+    _hog.clear()
+    try:
+        os.remove(DISK_FILL_PATH)
+    except FileNotFoundError:
+        pass
 
 
 def allocate(step_mb, delay):
@@ -92,6 +166,25 @@ class Handler(BaseHTTPRequestHandler):
             delay = float(query.get("delay", ["0.1"])[0])
             threading.Thread(target=allocate, args=(step_mb, delay), daemon=True).start()
             self._reply(202, {"status": "allocating", "step_mb": step_mb, "delay_s": delay})
+        elif url.path == "/mem":
+            percent = min(max(int(query.get("percent", ["90"])[0]), 1), MEMORY_HOLD_MAX_PERCENT)
+            limit = memory_limit_mb()
+            if limit < 0 or memory_mb() < 0:
+                self._reply(400, {"error": "container has no readable memory limit"})
+            else:
+                threading.Thread(target=hold_memory, args=(percent,), daemon=True).start()
+                self._reply(202, {"status": "filling memory", "percent": percent, "limit_mb": limit})
+        elif url.path == "/cpu":
+            seconds = int(query.get("seconds", ["480"])[0])
+            burn_cpu(seconds)
+            self._reply(202, {"status": "burning every cpu", "cpus": os.cpu_count(), "seconds": seconds})
+        elif url.path == "/disk":
+            percent = min(max(int(query.get("percent", ["92"])[0]), 1), DISK_FILL_MAX_PERCENT)
+            threading.Thread(target=fill_disk, args=(percent,), daemon=True).start()
+            self._reply(202, {"status": "filling disk", "percent": percent, "now": round(disk_percent(), 1)})
+        elif url.path == "/release":
+            release()
+            self._reply(200, {"status": "released", "memory_mb": memory_mb(), "disk_percent": round(disk_percent(), 1)})
         elif url.path == "/crash":
             threading.Timer(0.5, crash).start()
             self._reply(202, {"status": "crashing in 0.5s"})
