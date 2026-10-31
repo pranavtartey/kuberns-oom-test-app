@@ -13,6 +13,7 @@ Stdlib Python, listens on `0.0.0.0:8000` (the port Kuberns publishes for Python 
 | `/crash` | Stack trace pointing at `price_of_first_item`, exit 1 | `exit_recovered` (Docker restarts it at once) |
 | `/exit?code=3` | Exit with the given code | `exit_recovered`, or `exit_nonzero` if it stays down |
 | `/sick?seconds=180` | `/health` answers 500 for that long while the app keeps running | `unhealthy` |
+| `/loop?seconds=60` | Exits now and again on every start for that long (max 300), so the container stays down past the agent's 15s wait | `exit_nonzero` (plus an `exit_recovered` if the agent sees it back up afterwards) |
 | `/mem?percent=90` | Grows to that share of the container's memory limit and holds there (97 for critical, never above 98) | `memory_pressure` from 85%, `memory_critical` from 95% |
 | `/cpu?seconds=480` | One busy process per CPU for that long, so the container uses the whole host | `cpu_throttled` |
 | `/disk?percent=92` | Writes `/tmp/disk-fill` until the root filesystem is that full (never above 97) | `disk_pressure` from 90%, `disk_full` from 95% |

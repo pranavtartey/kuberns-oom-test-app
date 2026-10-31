@@ -28,6 +28,9 @@ DISK_FILL_MAX_PERCENT = 97
 MEMORY_HOLD_MAX_PERCENT = 98
 _stop_fill = threading.Event()
 
+CRASH_LOOP_PATH = "/tmp/crash-loop-until"
+CRASH_LOOP_MAX_SECONDS = 300
+
 
 def memory_mb():
     """Container memory in MB from the cgroup (v2, then v1); -1 if unreadable."""
@@ -109,6 +112,22 @@ def release():
         pass
 
 
+def in_crash_loop():
+    """True while a /loop window is open. The file survives restarts because Docker restarts the
+    same container, so every boot inside the window exits again."""
+    try:
+        with open(CRASH_LOOP_PATH) as f:
+            return time.time() < float(f.read())
+    except (OSError, ValueError):
+        return False
+
+
+def start_crash_loop(seconds):
+    with open(CRASH_LOOP_PATH, "w") as f:
+        f.write(str(time.time() + seconds))
+    threading.Timer(0.5, exit_with, args=(1,)).start()
+
+
 def allocate(step_mb, delay):
     while True:
         # b"x" * n really writes the pages, so the memory is resident, not just reserved.
@@ -185,6 +204,10 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/release":
             release()
             self._reply(200, {"status": "released", "memory_mb": memory_mb(), "disk_percent": round(disk_percent(), 1)})
+        elif url.path == "/loop":
+            seconds = min(max(int(query.get("seconds", ["60"])[0]), 1), CRASH_LOOP_MAX_SECONDS)
+            start_crash_loop(seconds)
+            self._reply(202, {"status": "crashing on every start", "seconds": seconds})
         elif url.path == "/crash":
             threading.Timer(0.5, crash).start()
             self._reply(202, {"status": "crashing in 0.5s"})
@@ -197,6 +220,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if in_crash_loop():
+        print("crash loop window is open, exiting", flush=True)
+        sys.exit(1)
     if os.environ.get("CRASH_ON_START") == "1":
         print("CRASH_ON_START=1, crashing on boot", flush=True)
         crash()
